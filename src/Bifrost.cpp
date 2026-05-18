@@ -9,6 +9,7 @@
 #include <iostream>
 #include <stdexcept>
 #include <string>
+#include <cstdlib>
 
 #include <cpr/cpr.h>
 #include <nlohmann/json.hpp>
@@ -17,58 +18,45 @@ using namespace std;
 using json = nlohmann::json;
 namespace fs = std::filesystem;
 
-#define SERVER_URL "http://localhost:5000/signup/"
+// Read from environment variable — set LOGIN_SERVER_URL in Railway Variables.
+// Falls back to localhost for local development.
+string getServerUrl() {
+    const char* env = std::getenv("LOGIN_SERVER_URL");
+    return env ? string(env) : string("http://localhost:5000/signup/");
+}
+
 #define SECRET_KEY_FILE "shared_secret.txt"
 
 string generateTOTP(Bytes key) {
-    // TOTP
     time_t timestamp = time(NULL);
-
     cpp_int timestep = timestamp / 30;
-
     Bytes message = resizeKey(cppIntToBytes(timestep), nBytes);
-
     Bytes hmac_bytes = hmac_sha1(key, message);
-
     int offset = hmac_bytes[hmac_bytes.size() - 1] & 0x0F;
-
     Bytes sample_bytes;
-
     for (int i = offset; i < offset + 4; i++) {
         sample_bytes.push_back(hmac_bytes[i]);
     }
-
     sample_bytes[0] &= 0x7f;
-
     cpp_int sample = bytesToCppInt(sample_bytes);
-
     int OTP = (sample % 1000000).convert_to<int>();
-
     string otp_string = to_string(OTP);
-
     while (otp_string.length() < 6) {
         otp_string = "0" + otp_string;
     }
-
     return otp_string;
 }
 
 Bytes exchangeSecret(string registrationCode) {
     Diffie_Hellman bifrostDH;
-
     string bifrostPublicKeyHex = cppIntToHex(bifrostDH.public_key);
-
     json requestBody;
-
     requestBody["bifrost-public-key"] = bifrostPublicKeyHex;
 
-    string url = SERVER_URL + registrationCode;
+    string url = getServerUrl() + registrationCode;
 
-    cout << "\nSending POST request to:\n";
-    cout << url << endl;
-
-    cout << "\nBifrost public key:\n";
-    cout << bifrostPublicKeyHex << endl;
+    cout << "\nSending POST request to:\n" << url << endl;
+    cout << "\nBifrost public key:\n" << bifrostPublicKeyHex << endl;
 
     cpr::Response response =
         cpr::Post(cpr::Url{url}, cpr::Body{requestBody.dump()},
@@ -77,20 +65,15 @@ Bytes exchangeSecret(string registrationCode) {
     if (response.error) {
         throw runtime_error(response.error.message);
     }
-
     if (response.status_code != 200) {
-        cout << "\nServer response:\n";
-        cout << response.text << endl;
-
+        cout << "\nServer response:\n" << response.text << endl;
         throw runtime_error("Server returned status code " +
                             to_string(response.status_code));
     }
 
     json responseJson = json::parse(response.text);
-
     if (!responseJson.contains("server-public-key")) {
-        throw runtime_error(
-            "Response JSON does not contain server-public-key.");
+        throw runtime_error("Response JSON does not contain server-public-key.");
     }
 
     Bytes serverPublicKey = hexToBytes(responseJson["server-public-key"]);
@@ -118,7 +101,6 @@ int main() {
     } else {
         try {
             string registrationCode;
-
             cout << "Enter 6-digit registration code: ";
             cin >> registrationCode;
 
@@ -126,14 +108,14 @@ int main() {
                 throw runtime_error("Registration code must be 6 digits.");
             }
 
-            Bytes sharedSecretKey = exchangeSecret(registrationCode);
+            sharedSecretKey = exchangeSecret(registrationCode);
             string sharedSecret_hex = bytesToHex(sharedSecretKey);
 
-            ofstream file("shared_secret.txt");
+            ofstream file(SECRET_KEY_FILE);
             if (!file) {
                 throw runtime_error("Could not create shared_secret.txt");
             }
-            file << bytesToHex(sharedSecretKey);
+            file << sharedSecret_hex;
             file.close();
             cout << "\nShared secret saved in shared_secret.txt" << endl;
         } catch (const exception &e) {
