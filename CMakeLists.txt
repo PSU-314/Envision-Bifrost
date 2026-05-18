@@ -3,7 +3,7 @@ project(Bifrost)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
-find_package(OpenSSL REQUIRED)
+
 # 3. Find Dependencies
 # Finds OpenSSL on Arch Linux (provided by libssl-dev/openssl)
 find_package(OpenSSL REQUIRED)
@@ -24,7 +24,7 @@ FetchContent_Declare(
 )
 # Disable CPR's internal tests and PDF generation to keep build times fast
 set(CPR_BUILD_TESTS OFF CACHE INTERNAL "")
-FetchContent_MakeAvailable(cpr)
+FetchContent_MakeAvailable(cpr)    
 
 file (GLOB SOURCES "src/*.cpp")
 
@@ -32,7 +32,7 @@ add_executable(${PROJECT_NAME} ${SOURCES})
 
 target_include_directories(${PROJECT_NAME} PRIVATE
     include
-    ${OPENSSL_INLCUDE_DIR}
+    ${OPENSSL_INCLUDE_DIR}
 )
 target_link_libraries(${PROJECT_NAME} PRIVATE OpenSSL::Crypto cpr::cpr nlohmann_json::nlohmann_json)
 
