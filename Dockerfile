@@ -22,7 +22,6 @@ RUN cp build/Bifrost ./bifrost-bin
 COPY bifrost_server.py .
 
 ENV BIFROST_BIN=/app/bifrost-bin
-ENV SECRET_KEY_PATH=/app/shared_secret.txt
 # Set this in Railway Variables tab:
 # LOGIN_SERVER_URL=https://your-login-server.up.railway.app/signup/
 

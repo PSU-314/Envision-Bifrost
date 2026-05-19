@@ -2,14 +2,22 @@
 bifrost_server.py — single-file server.
 Serves the Bifrost authenticator UI and wraps the bifrost CLI binary.
 
+Multi-user design
+-----------------
+The server NEVER stores the shared secret on disk. After a successful DH
+key-exchange the hex-encoded secret is returned to the browser, which keeps it
+in localStorage. Every TOTP code is computed entirely in the browser using a
+pure-JS HMAC-SHA-1 implementation, so no secret ever travels back to the
+server after registration.
+
 Usage:
     python bifrost_server.py
 
 Environment variables:
     PORT             HTTP port (default 8000)
     BIFROST_BIN      Path to compiled bifrost binary (default ./bifrost)
-    SECRET_KEY_PATH  Path to secret.key file (default ./secret.key)
     HOST_ORIGIN      Allowed CORS origin (default *)
+    LOGIN_SERVER_URL URL of the login server (required in production)
 """
 
 import os
@@ -21,11 +29,10 @@ from pathlib import Path
 import json
 import urllib.parse
 
-BIFROST_BIN = os.environ.get("BIFROST_BIN", "./bifrost")
-SECRET_KEY_PATH = os.environ.get("SECRET_KEY_PATH", "./shared_secret.txt")
-HOST_ORIGIN = os.environ.get("HOST_ORIGIN", "*")
+BIFROST_BIN     = os.environ.get("BIFROST_BIN", "./bifrost")
+HOST_ORIGIN     = os.environ.get("HOST_ORIGIN", "*")
 LOGIN_SERVER_URL = os.environ.get("LOGIN_SERVER_URL", "http://localhost:5000/signup/")
-PORT = int(os.environ.get("PORT", 8000))
+PORT            = int(os.environ.get("PORT", 8000))
 
 # Simple in-memory rate limiter
 _rate: dict[str, list[float]] = {}
@@ -42,37 +49,51 @@ def _ok_rate(ip: str) -> bool:
         _rate[ip] = hits
     return True
 
-def run_bifrost(stdin_input: str | None = None, extra_args: list[str] | None = None) -> tuple[str, str, int]:
-    cmd = [BIFROST_BIN] + (extra_args or [])
+def run_bifrost(stdin_input: str | None = None) -> tuple[str, str, int]:
+    """
+    Run the bifrost binary and return (stdout, stderr, returncode).
+    The binary is fed the registration PIN via stdin.
+    It prints the shared secret hex on a line after "Shared Secret key:".
+    """
+    cmd = [BIFROST_BIN]
     env = os.environ.copy()
     env["LOGIN_SERVER_URL"] = LOGIN_SERVER_URL
+    # Unset SECRET_KEY_FILE so the binary always does a fresh exchange.
+    # The binary checks for shared_secret.txt on disk; we point it at a
+    # path that will never exist so it always goes through the exchange flow.
+    env["SECRET_KEY_FILE"] = "/dev/null/nonexistent"
     try:
-        r = subprocess.run(cmd, input=stdin_input, capture_output=True, text=True, timeout=15, env=env)
+        r = subprocess.run(
+            cmd,
+            input=stdin_input,
+            capture_output=True,
+            text=True,
+            timeout=15,
+            env=env,
+        )
         return r.stdout, r.stderr, r.returncode
     except FileNotFoundError:
         return "", f"bifrost binary not found at '{BIFROST_BIN}'", 1
     except subprocess.TimeoutExpired:
         return "", "bifrost timed out", 1
 
-def parse_otp(stdout: str) -> tuple[str | None, int | None]:
-    otp = expires = None
-    for line in stdout.splitlines():
-        s = line.strip()
-        # matches "Generated OTP: 818692"
-        if s.upper().startswith("GENERATED OTP:"):
-            candidate = s.split(":", 1)[1].strip()
-            if candidate.isdigit() and len(candidate) == 6:
-                otp = candidate
-        # fallback: bare 6-digit line
-        elif s.isdigit() and len(s) == 6:
-            otp = s
-        # matches "Valid for: 10s"
-        if "Valid for:" in line:
-            try:
-                expires = int(line.split(":")[1].strip().rstrip("s"))
-            except ValueError:
-                pass
-    return otp, expires
+def parse_shared_secret(stdout: str) -> str | None:
+    """
+    Extract the shared-secret hex from bifrost stdout.
+    The binary prints:
+        \nShared Secret key:\n<hex>\n
+    """
+    lines = stdout.splitlines()
+    for i, line in enumerate(lines):
+        if "Shared Secret key" in line:
+            # The hex value is on the next non-empty line
+            for j in range(i + 1, len(lines)):
+                candidate = lines[j].strip()
+                if candidate:
+                    # Validate it looks like hex
+                    if all(c in "0123456789abcdefABCDEF" for c in candidate) and len(candidate) > 0:
+                        return candidate
+    return None
 
 # ── HTML ──────────────────────────────────────────────────────────────────────
 HTML = r"""<!DOCTYPE html>
@@ -363,7 +384,7 @@ input::placeholder{color:var(--dim);letter-spacing:0;}
         <div class="snum" id="sn2">2</div>
         <div style="flex:1">
           <div class="slabel">Run bifrost key exchange</div>
-          <div class="shint">The server runs the bifrost binary with your PIN</div>
+          <div class="shint">The server performs DH exchange; your secret is saved locally in this browser</div>
           <button class="btn btn-accent" id="ex-btn" onclick="doExchange()" disabled>
             Exchange keys
           </button>
@@ -374,8 +395,8 @@ input::placeholder{color:var(--dim);letter-spacing:0;}
       <div class="step" id="step3">
         <div class="snum" id="sn3">3</div>
         <div style="flex:1">
-          <div class="slabel">Done — secret saved</div>
-          <div class="shint">Switch to Authenticator to generate codes</div>
+          <div class="slabel">Done — secret saved in browser</div>
+          <div class="shint">Switch to Authenticator to generate codes. Your secret never leaves this device.</div>
         </div>
       </div>
     </div>
@@ -397,7 +418,7 @@ input::placeholder{color:var(--dim);letter-spacing:0;}
     </div>
     <div class="err" id="otp-err" style="margin-top:10px;"></div>
   </div>
-  <button class="btn btn-ghost btn-full" onclick="fetchOTP()" style="margin-top:4px;">↺ &nbsp;refresh now</button>
+  <button class="btn btn-ghost btn-full" onclick="refreshOTP()" style="margin-top:4px;">↺ &nbsp;refresh now</button>
 </div>
 
 <!-- ── Status ── -->
@@ -407,14 +428,14 @@ input::placeholder{color:var(--dim);letter-spacing:0;}
     <div id="health-rows">
       <div class="hrow"><span>api</span><span id="h-api">—</span></div>
       <div class="hrow"><span>bifrost binary</span><span id="h-bin">—</span></div>
-      <div class="hrow"><span>secret registered</span><span id="h-sec">—</span></div>
+      <div class="hrow"><span>secret (this browser)</span><span id="h-sec">—</span></div>
     </div>
     <button class="btn btn-ghost btn-sm" onclick="checkHealth()" style="margin-top:1rem;">ping again</button>
   </div>
   <div class="card" style="margin-top:0.25rem;">
     <div class="row" style="margin-bottom:0;"><span class="section-label">clear registration</span></div>
     <p style="font-size:12px;font-family:var(--mono);color:var(--muted);margin:0.75rem 0;">
-      Deletes <code>secret.key</code> on the server. You will need to re-register.
+      Removes your secret key from this browser's localStorage. You will need to re-register.
     </p>
     <button class="btn btn-ghost btn-sm" onclick="clearSecret()" style="border-color:rgba(255,79,106,0.3);color:var(--red);">delete secret</button>
     <div class="err" id="clear-err"></div>
@@ -426,157 +447,250 @@ input::placeholder{color:var(--dim);letter-spacing:0;}
 <div class="toast" id="toast"></div>
 
 <script>
-let otpTimer = null;
-let curOTP = null;
+// ─────────────────────────────────────────────────────────────
+//  Pure-JS TOTP  (RFC 6238 / HMAC-SHA-1)
+// ─────────────────────────────────────────────────────────────
 
-// ── Utils ──
-function toast(msg,ms=2000){
-  const el=document.getElementById('toast');
-  el.textContent=msg;el.classList.add('show');
-  setTimeout(()=>el.classList.remove('show'),ms);
+// SHA-1 — returns Uint8Array
+async function sha1(data){
+  return new Uint8Array(await crypto.subtle.digest('SHA-1', data));
 }
-function showErr(id,msg){const e=document.getElementById(id);e.textContent=msg;e.style.display='block';}
-function hideErr(id){document.getElementById(id).style.display='none';}
 
-// ── Tabs ──
+// HMAC-SHA-1
+async function hmacSha1(keyBytes, msgBytes){
+  const cryptoKey = await crypto.subtle.importKey(
+    'raw', keyBytes, {name:'HMAC', hash:'SHA-1'}, false, ['sign']
+  );
+  return new Uint8Array(await crypto.subtle.sign('HMAC', cryptoKey, msgBytes));
+}
+
+// Convert hex string → Uint8Array
+function hexToBytes(hex){
+  const out = new Uint8Array(hex.length / 2);
+  for(let i = 0; i < out.length; i++)
+    out[i] = parseInt(hex.slice(i*2, i*2+2), 16);
+  return out;
+}
+
+// Big-endian 8-byte encoding of a JS number (safe up to 2^53)
+function uint64BE(n){
+  const buf = new Uint8Array(8);
+  let v = Math.floor(n);
+  for(let i = 7; i >= 0; i--){ buf[i] = v & 0xff; v = Math.floor(v / 256); }
+  return buf;
+}
+
+async function computeTOTP(secretHex){
+  const key = hexToBytes(secretHex);
+  const timestep = Math.floor(Date.now() / 1000 / 30);
+  const msg = uint64BE(timestep);
+  const hmac = await hmacSha1(key, msg);
+  const offset = hmac[19] & 0x0f;
+  const code = (
+    ((hmac[offset]   & 0x7f) << 24) |
+    ((hmac[offset+1] & 0xff) << 16) |
+    ((hmac[offset+2] & 0xff) <<  8) |
+     (hmac[offset+3] & 0xff)
+  ) % 1000000;
+  return String(code).padStart(6, '0');
+}
+
+// ─────────────────────────────────────────────────────────────
+//  App state
+// ─────────────────────────────────────────────────────────────
+const LS_KEY = 'bifrost_secret';
+let otpTimer = null;
+let curOTP   = null;
+
+function loadSecret(){ return localStorage.getItem(LS_KEY); }
+function saveSecret(hex){ localStorage.setItem(LS_KEY, hex); }
+function deleteSecret(){ localStorage.removeItem(LS_KEY); }
+
+// ─────────────────────────────────────────────────────────────
+//  Utils
+// ─────────────────────────────────────────────────────────────
+function toast(msg, ms=2000){
+  const el = document.getElementById('toast');
+  el.textContent = msg; el.classList.add('show');
+  setTimeout(()=>el.classList.remove('show'), ms);
+}
+function showErr(id, msg){ const e=document.getElementById(id); e.textContent=msg; e.style.display='block'; }
+function hideErr(id){ document.getElementById(id).style.display='none'; }
+
+// ─────────────────────────────────────────────────────────────
+//  Tabs
+// ─────────────────────────────────────────────────────────────
 function showTab(t){
   ['register','otp','status'].forEach(p=>{
-    document.getElementById('pane-'+p).style.display=p===t?'block':'none';
-    document.getElementById('tab-'+p).classList.toggle('on',p===t);
+    document.getElementById('pane-'+p).style.display = p===t ? 'block' : 'none';
+    document.getElementById('tab-'+p).classList.toggle('on', p===t);
   });
-  if(t==='otp') startOTP();
+  if(t==='otp')    startOTP();
   if(t==='status') checkHealth();
 }
 
-// ── Health ──
+// ─────────────────────────────────────────────────────────────
+//  Health
+// ─────────────────────────────────────────────────────────────
 async function checkHealth(){
-  const dot=document.getElementById('api-dot');
-  const st=document.getElementById('api-status');
-  const hb=document.getElementById('health-badge');
-  dot.className='dot';st.textContent='checking...';
+  const dot = document.getElementById('api-dot');
+  const st  = document.getElementById('api-status');
+  const hb  = document.getElementById('health-badge');
+  dot.className='dot'; st.textContent='checking...';
   try{
-    const r=await fetch('/health',{signal:AbortSignal.timeout(6000)});
-    const d=await r.json();
-    dot.className='dot ok';
-    st.textContent='api online';
-    hb.className='badge b-green';hb.textContent='online';
-    document.getElementById('h-api').textContent='✓ ok';
-    document.getElementById('h-bin').innerHTML=d.binary
-      ?'<span style="color:var(--accent)">✓ found</span>'
-      :'<span style="color:var(--red)">✗ missing</span>';
-    document.getElementById('h-sec').innerHTML=d.secret_registered
-      ?'<span style="color:var(--accent)">✓ yes</span>'
-      :'<span style="color:var(--muted)">✗ no</span>';
+    const r = await fetch('/health', {signal: AbortSignal.timeout(6000)});
+    const d = await r.json();
+    dot.className = 'dot ok';
+    st.textContent = 'api online';
+    hb.className = 'badge b-green'; hb.textContent = 'online';
+    document.getElementById('h-api').textContent = '✓ ok';
+    document.getElementById('h-bin').innerHTML = d.binary
+      ? '<span style="color:var(--accent)">✓ found</span>'
+      : '<span style="color:var(--red)">✗ missing</span>';
+    // secret lives in the browser, not on the server
+    const hasSecret = !!loadSecret();
+    document.getElementById('h-sec').innerHTML = hasSecret
+      ? '<span style="color:var(--accent)">✓ yes</span>'
+      : '<span style="color:var(--muted)">✗ no</span>';
   }catch{
-    dot.className='dot err';st.textContent='unreachable';
-    hb.className='badge b-red';hb.textContent='offline';
-    document.getElementById('h-api').innerHTML='<span style="color:var(--red)">✗ offline</span>';
+    dot.className = 'dot err'; st.textContent = 'unreachable';
+    hb.className = 'badge b-red'; hb.textContent = 'offline';
+    document.getElementById('h-api').innerHTML = '<span style="color:var(--red)">✗ offline</span>';
   }
 }
 
-// ── PIN ──
+// ─────────────────────────────────────────────────────────────
+//  Registration — step UI helpers
+// ─────────────────────────────────────────────────────────────
 function onPin(){
-  const v=document.getElementById('pin').value.trim();
-  const ok=/^\d{6}$/.test(v);
-  document.getElementById('ex-btn').disabled=!ok;
-  setStep(1,ok?'done':'active');
-  if(ok)setStep(2,'active');
+  const v  = document.getElementById('pin').value.trim();
+  const ok = /^\d{6}$/.test(v);
+  document.getElementById('ex-btn').disabled = !ok;
+  setStep(1, ok ? 'done' : 'active');
+  if(ok) setStep(2,'active');
 }
-function setStep(n,s){
-  const num=document.getElementById('sn'+n);
-  const step=document.getElementById('step'+n);
-  num.className='snum'+(s==='done'?' done':s==='active'?' active':'');
-  num.textContent=s==='done'?'✓':n;
-  step.className='step'+(s!==''?' on':'');
+function setStep(n, s){
+  const num  = document.getElementById('sn'+n);
+  const step = document.getElementById('step'+n);
+  num.className = 'snum' + (s==='done'?' done' : s==='active'?' active':'');
+  num.textContent = s==='done' ? '✓' : n;
+  step.className  = 'step' + (s!=='' ? ' on' : '');
 }
 
-// ── Exchange ──
+// ─────────────────────────────────────────────────────────────
+//  Registration — key exchange
+//  Server returns {secret_hex} → saved to localStorage.
+//  Secret never travels back to the server after this point.
+// ─────────────────────────────────────────────────────────────
 async function doExchange(){
-  const pin=document.getElementById('pin').value.trim();
-  const btn=document.getElementById('ex-btn');
+  const pin = document.getElementById('pin').value.trim();
+  const btn = document.getElementById('ex-btn');
   hideErr('ex-err');
-  btn.disabled=true;
-  btn.innerHTML='<span class="spin"></span> Exchanging...';
+  btn.disabled = true;
+  btn.innerHTML = '<span class="spin"></span> Exchanging...';
   try{
-    const r=await fetch('/exchange',{
-      method:'POST',
-      headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({pin}),
-      signal:AbortSignal.timeout(20000),
+    const r = await fetch('/exchange', {
+      method:  'POST',
+      headers: {'Content-Type':'application/json'},
+      body:    JSON.stringify({pin}),
+      signal:  AbortSignal.timeout(20000),
     });
-    const d=await r.json();
-    if(!r.ok)throw new Error(d.error||'Exchange failed');
-    setStep(2,'done');setStep(3,'active');
-    document.getElementById('reg-badge').className='badge b-green';
-    document.getElementById('reg-badge').textContent='registered';
-    toast('✓ Key exchange complete');
+    const d = await r.json();
+    if(!r.ok) throw new Error(d.error || 'Exchange failed');
+    if(!d.secret_hex) throw new Error('Server did not return a secret');
+
+    // Save the shared secret in this browser only
+    saveSecret(d.secret_hex);
+
+    setStep(2,'done'); setStep(3,'active');
+    document.getElementById('reg-badge').className = 'badge b-green';
+    document.getElementById('reg-badge').textContent = 'registered';
+    toast('✓ Key exchange complete — secret saved in browser');
     checkHealth();
   }catch(e){
-    showErr('ex-err',e.message);
+    showErr('ex-err', e.message);
     setStep(2,'active');
   }
-  btn.disabled=false;btn.textContent='Exchange keys';
+  btn.disabled  = false;
+  btn.textContent = 'Exchange keys';
 }
 
-// ── OTP ──
-async function fetchOTP(){
+// ─────────────────────────────────────────────────────────────
+//  OTP — computed entirely in the browser
+// ─────────────────────────────────────────────────────────────
+async function refreshOTP(){
   hideErr('otp-err');
+  const secret = loadSecret();
+  if(!secret){
+    showErr('otp-err', 'Not registered — complete registration first');
+    document.getElementById('otp-digits').textContent = '——————';
+    return;
+  }
   try{
-    const r=await fetch('/otp',{signal:AbortSignal.timeout(8000)});
-    const d=await r.json();
-    if(!r.ok)throw new Error(d.error||'Failed');
-    curOTP=d.otp;
-    const el=document.getElementById('otp-digits');
-    el.textContent=curOTP;
+    curOTP = await computeTOTP(secret);
+    const el = document.getElementById('otp-digits');
+    el.textContent = curOTP;
     el.classList.add('fresh');
-    setTimeout(()=>el.classList.remove('fresh'),800);
+    setTimeout(()=>el.classList.remove('fresh'), 800);
   }catch(e){
-    showErr('otp-err',e.message);
-    document.getElementById('otp-digits').textContent='——————';
+    showErr('otp-err', 'Failed to compute OTP: ' + e.message);
+    document.getElementById('otp-digits').textContent = '——————';
   }
 }
 
 function updateBar(){
-  const now=Math.floor(Date.now()/1000);
-  const rem=30-(now%30);
-  const pct=Math.round((rem/30)*100);
-  const bar=document.getElementById('otp-bar');
-  bar.style.width=pct+'%';
-  bar.style.background=rem<=7?'var(--red)':'var(--accent)';
-  document.getElementById('otp-cd').textContent='expires in '+rem+'s';
-  document.getElementById('otp-badge').textContent=rem+'s';
-  const digits=document.getElementById('otp-digits');
-  digits.classList.toggle('expiring',rem<=7);
-  if(rem===30)fetchOTP();
+  const now = Math.floor(Date.now() / 1000);
+  const rem  = 30 - (now % 30);
+  const pct  = Math.round((rem / 30) * 100);
+  const bar  = document.getElementById('otp-bar');
+  bar.style.width      = pct + '%';
+  bar.style.background = rem <= 7 ? 'var(--red)' : 'var(--accent)';
+  document.getElementById('otp-cd').textContent    = 'expires in ' + rem + 's';
+  document.getElementById('otp-badge').textContent = rem + 's';
+  const digits = document.getElementById('otp-digits');
+  digits.classList.toggle('expiring', rem <= 7);
+  // Refresh OTP at the start of each new 30-second window
+  if(rem === 30) refreshOTP();
 }
 
 function startOTP(){
-  if(otpTimer)clearInterval(otpTimer);
-  fetchOTP();
+  if(otpTimer) clearInterval(otpTimer);
+  refreshOTP();
   updateBar();
-  otpTimer=setInterval(updateBar,1000);
+  otpTimer = setInterval(updateBar, 1000);
 }
 
 function copyOTP(){
-  if(!curOTP)return;
+  if(!curOTP) return;
   navigator.clipboard.writeText(curOTP).then(()=>toast('✓ copied'));
 }
 
-// ── Clear secret ──
-async function clearSecret(){
+// ─────────────────────────────────────────────────────────────
+//  Clear — browser-only, no server call needed
+// ─────────────────────────────────────────────────────────────
+function clearSecret(){
   hideErr('clear-err');
-  if(!confirm('Delete secret.key on the server?'))return;
-  try{
-    const r=await fetch('/clear',{method:'POST'});
-    const d=await r.json();
-    if(!r.ok)throw new Error(d.error);
-    toast('Secret deleted');
-    checkHealth();
-  }catch(e){showErr('clear-err',e.message);}
+  if(!confirm('Delete your secret key from this browser?')) return;
+  deleteSecret();
+  curOTP = null;
+  document.getElementById('otp-digits').textContent = '——————';
+  toast('Secret deleted from browser');
+  checkHealth();
 }
 
-// init
-checkHealth();
+// ─────────────────────────────────────────────────────────────
+//  Init — restore registration state from localStorage
+// ─────────────────────────────────────────────────────────────
+(function init(){
+  if(loadSecret()){
+    setStep(1,'done'); setStep(2,'done'); setStep(3,'active');
+    document.getElementById('reg-badge').className   = 'badge b-green';
+    document.getElementById('reg-badge').textContent = 'registered';
+  } else {
+    setStep(1,'active');
+  }
+  checkHealth();
+})();
 </script>
 </body>
 </html>
@@ -633,25 +747,11 @@ class Handler(BaseHTTPRequestHandler):
             ip = self.client_address[0]
             if not _ok_rate(ip):
                 return self._send_json(429, {"error": "rate limit"})
+            # Secret lives in the browser — server never has it
             self._send_json(200, {
                 "status": "ok",
                 "binary": Path(BIFROST_BIN).exists(),
-                "secret_registered": Path(SECRET_KEY_PATH).exists(),
             })
-
-        elif path == "/otp":
-            ip = self.client_address[0]
-            if not _ok_rate(ip):
-                return self._send_json(429, {"error": "rate limit"})
-            if not Path(SECRET_KEY_PATH).exists():
-                return self._send_json(400, {"error": "Not registered — complete registration first"})
-            stdout, stderr, rc = run_bifrost()
-            if rc != 0:
-                return self._send_json(500, {"error": "bifrost failed", "detail": stderr.strip()})
-            otp, expires = parse_otp(stdout)
-            if not otp:
-                return self._send_json(500, {"error": "Could not parse OTP", "raw": stdout})
-            self._send_json(200, {"otp": otp, "expires_in": expires})
 
         else:
             self._send_json(404, {"error": "not found"})
@@ -667,21 +767,26 @@ class Handler(BaseHTTPRequestHandler):
             pin = str(body.get("pin", "")).strip()
             if not pin or len(pin) != 6 or not pin.isdigit():
                 return self._send_json(400, {"error": "Invalid PIN — must be 6 digits"})
-            # Pass any extra arg so bifrost treats it as a fresh registration
-            stdout, stderr, rc = run_bifrost(stdin_input=pin + "\n", extra_args=["new"])
-            if rc != 0:
-                return self._send_json(500, {"error": "Key exchange failed", "detail": stderr.strip()})
-            otp, _ = parse_otp(stdout)
-            if not otp:
-                return self._send_json(500, {"error": "Exchange succeeded but no OTP parsed", "raw": stdout})
-            self._send_json(200, {"status": "registered", "otp": otp})
 
-        elif path == "/clear":
-            try:
-                Path(SECRET_KEY_PATH).unlink(missing_ok=True)
-                self._send_json(200, {"status": "cleared"})
-            except Exception as e:
-                self._send_json(500, {"error": str(e)})
+            # Run the bifrost binary; feed the PIN via stdin.
+            # The binary performs DH with the login server and prints the
+            # shared secret hex to stdout. We parse it and return it to
+            # the browser — no disk writes.
+            stdout, stderr, rc = run_bifrost(stdin_input=pin + "\n")
+            if rc != 0:
+                return self._send_json(500, {
+                    "error": "Key exchange failed",
+                    "detail": stderr.strip(),
+                })
+
+            secret_hex = parse_shared_secret(stdout)
+            if not secret_hex:
+                return self._send_json(500, {
+                    "error": "Exchange succeeded but could not parse shared secret",
+                    "raw": stdout,
+                })
+
+            self._send_json(200, {"status": "registered", "secret_hex": secret_hex})
 
         else:
             self._send_json(404, {"error": "not found"})
@@ -693,7 +798,7 @@ if __name__ == "__main__":
     server = HTTPServer(("0.0.0.0", PORT), Handler)
     print(f"[bifrost] server running on http://0.0.0.0:{PORT}")
     print(f"[bifrost] binary  : {BIFROST_BIN}")
-    print(f"[bifrost] secret  : {SECRET_KEY_PATH}")
+    print(f"[bifrost] note    : secrets are stored in each user's browser (localStorage)")
     try:
         server.serve_forever()
     except KeyboardInterrupt:

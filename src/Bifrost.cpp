@@ -5,7 +5,6 @@
 #include <utilities.hpp>
 
 #include <ctime>
-#include <fstream>
 #include <iostream>
 #include <stdexcept>
 #include <string>
@@ -16,7 +15,6 @@
 
 using namespace std;
 using json = nlohmann::json;
-namespace fs = std::filesystem;
 
 // Read from environment variable — set LOGIN_SERVER_URL in Railway Variables.
 // Falls back to localhost for local development.
@@ -24,8 +22,6 @@ string getServerUrl() {
     const char* env = std::getenv("LOGIN_SERVER_URL");
     return env ? string(env) : string("http://localhost:5000/signup/");
 }
-
-#define SECRET_KEY_FILE "shared_secret.txt"
 
 string generateTOTP(Bytes key) {
     time_t timestamp = time(NULL);
@@ -87,47 +83,25 @@ Bytes exchangeSecret(string registrationCode) {
 }
 
 int main() {
-    Bytes sharedSecretKey;
+    try {
+        string registrationCode;
+        cout << "Enter 6-digit registration code: ";
+        cin >> registrationCode;
 
-    if (fs::exists(SECRET_KEY_FILE)) {
-        ifstream saved_file(SECRET_KEY_FILE);
-        if (!saved_file) {
-            throw runtime_error("couldn't open shared_secret.txt");
+        if (registrationCode.length() != 6) {
+            throw runtime_error("Registration code must be 6 digits.");
         }
-        string loaded_secret;
-        getline(saved_file, loaded_secret);
-        saved_file.close();
-        sharedSecretKey = resizeKey(hexToBytes(loaded_secret), nBytes);
-    } else {
-        try {
-            string registrationCode;
-            cout << "Enter 6-digit registration code: ";
-            cin >> registrationCode;
 
-            if (registrationCode.length() != 6) {
-                throw runtime_error("Registration code must be 6 digits.");
-            }
+        Bytes sharedSecretKey = exchangeSecret(registrationCode);
 
-            sharedSecretKey = exchangeSecret(registrationCode);
-            string sharedSecret_hex = bytesToHex(sharedSecretKey);
-
-            ofstream file(SECRET_KEY_FILE);
-            if (!file) {
-                throw runtime_error("Could not create shared_secret.txt");
-            }
-            file << sharedSecret_hex;
-            file.close();
-            cout << "\nShared secret saved in shared_secret.txt" << endl;
-        } catch (const exception &e) {
-            cerr << "\nError: " << e.what() << endl;
-            return 1;
-        }
+        string otp = generateTOTP(sharedSecretKey);
+        cout << "\nGenerated OTP: " << otp << endl;
+        int timeLeft = 30 - (time(NULL) % 30);
+        cout << "Valid for: " << timeLeft << "s" << endl;
+    } catch (const exception &e) {
+        cerr << "\nError: " << e.what() << endl;
+        return 1;
     }
-
-    string otp = generateTOTP(sharedSecretKey);
-    cout << "\nGenerated OTP: " << otp << endl;
-    int timeLeft = 30 - (time(NULL) % 30);
-    cout << "Valid for: " << timeLeft << "s" << endl;
 
     return 0;
 }
